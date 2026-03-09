@@ -761,9 +761,18 @@ def construct_gridded_tnp(
         )
 
     if isinstance(dim_yc, (tuple, list)):
-        dim_yc_total = int(sum(dim_yc))
+        dim_yc_values = tuple(int(d) for d in dim_yc)
+        dim_yc_total = int(sum(dim_yc_values))
+        if model_variant == "ootg" and len(dim_yc_values) >= 2:
+            dim_yc_grid = int(dim_yc_values[0])
+            dim_yc_point = int(sum(dim_yc_values[1:]))
+        else:
+            dim_yc_grid = dim_yc_total
+            dim_yc_point = dim_yc_total
     else:
         dim_yc_total = int(dim_yc)
+        dim_yc_grid = dim_yc_total
+        dim_yc_point = dim_yc_total
 
     if dim_aux_t not in (None, 0):
         warnings.warn(
@@ -825,7 +834,7 @@ def construct_gridded_tnp(
     except ImportError:
         BernoulliGammaLikelihood = None
 
-    xy_in_dim = dim_x + dim_yc_total + 1
+    xy_in_dim = dim_x + dim_yc_point + 1
     xy_encoder = MLP(
         in_dim=xy_in_dim,
         out_dim=d_model,
@@ -870,7 +879,7 @@ def construct_gridded_tnp(
         )
     else:
         xy_grid_encoder = MLP(
-            in_dim=dim_x + dim_yc_total,
+            in_dim=dim_x + dim_yc_grid,
             out_dim=d_model,
             num_layers=xy_encoder_num_layers,
             width=xy_encoder_width,
@@ -992,6 +1001,29 @@ def run_gridded_tnp_model(
     return dist
 
 
+def _to_torch_float(value) -> torch.Tensor:
+    if torch.is_tensor(value):
+        return value.float()
+
+    if hasattr(value, "y") and hasattr(value, "mask"):
+        value = value.y
+
+    if isinstance(value, np.ma.MaskedArray):
+        value = value.filled(np.nan)
+
+    if hasattr(value, "data") and not isinstance(value, np.ndarray):
+        value = value.data
+
+    arr = np.asarray(value)
+    if arr.dtype == np.object_:
+        arr = np.ma.asarray(arr)
+        if isinstance(arr, np.ma.MaskedArray):
+            arr = arr.filled(np.nan)
+        arr = np.asarray(arr, dtype=np.float32)
+
+    return torch.as_tensor(arr).float()
+
+
 def convert_task_to_gridded_tnp_args(
     task: Task,
     model_variant: Literal["gridded", "ootg"] = "gridded",
@@ -1029,6 +1061,7 @@ def convert_task_to_gridded_tnp_args(
         return x
 
     def point_y_to_tnp(y: torch.Tensor) -> torch.Tensor:
+        y = _to_torch_float(y)
         if y.ndim == 2:
             y = y[None, ...]
         if y.ndim != 3:
@@ -1038,6 +1071,7 @@ def convert_task_to_gridded_tnp_args(
         return y
 
     def grid_y_to_tnp(y_grid: torch.Tensor) -> torch.Tensor:
+        y_grid = _to_torch_float(y_grid)
         if y_grid.ndim == 3:
             y_grid = y_grid[None, ...]
         if y_grid.ndim != 4:
@@ -1054,12 +1088,41 @@ def convert_task_to_gridded_tnp_args(
             raise NotImplementedError(
                 "Only 2D gridded context coordinates are currently supported for OOTG variant."
             )
-        x1, x2 = x_grid_tuple
-        # Squeeze to 1D - handle various input shapes
-        while x1.ndim > 1:
-            x1 = x1.squeeze(0)
-        while x2.ndim > 1:
-            x2 = x2.squeeze(0)
+        x1 = _to_torch_float(x_grid_tuple[0])
+        x2 = _to_torch_float(x_grid_tuple[1])
+
+        def _coord_to_1d(coord: torch.Tensor, axis_hint: str) -> torch.Tensor:
+            if coord.ndim == 0:
+                return coord.unsqueeze(0)
+            if coord.ndim == 1:
+                return coord
+            if coord.ndim >= 3:
+                # Typical batched case from concat_tasks: (batch, 1, n) or (batch, n, 1)
+                c0 = coord[0]
+                if c0.ndim == 2 and (c0.shape[0] == 1 or c0.shape[1] == 1):
+                    return c0.reshape(-1)
+
+                # Fallback for higher-rank inputs: collapse batch and recurse.
+                return _coord_to_1d(c0, axis_hint)
+            if coord.ndim == 2:
+                if coord.shape[0] == 1 or coord.shape[1] == 1:
+                    return coord.reshape(-1)
+
+                if axis_hint == "x1":
+                    col0 = coord[:, :1]
+                    if torch.allclose(coord, col0.expand_as(coord)):
+                        return coord[:, 0]
+                    return coord[:, 0]
+
+                row0 = coord[:1, :]
+                if torch.allclose(coord, row0.expand_as(coord)):
+                    return coord[0, :]
+                return coord[0, :]
+
+            return coord.reshape(-1)
+
+        x1 = _coord_to_1d(x1, axis_hint="x1")
+        x2 = _coord_to_1d(x2, axis_hint="x2")
         gx1, gx2 = torch.meshgrid(x1, x2, indexing="ij")
         xc_grid = torch.stack((gx1, gx2), dim=-1)[None, ...]
         if batch_size > 1:
