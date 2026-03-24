@@ -1053,8 +1053,6 @@ def convert_task_to_gridded_tnp_args(
             x = x[None, ...]
         if x.ndim != 3:
             raise ValueError(f"Expected point X with ndim 2 or 3, got shape {tuple(x.shape)}")
-        if x.shape[-1] == task["X_t"][0].shape[1] if task["X_t"][0].ndim == 2 else False:
-            pass
         # DeepSensor convention is typically (batch, dim_x, n_points)
         if x.shape[1] <= x.shape[2]:
             return x.transpose(1, 2)
@@ -1135,7 +1133,12 @@ def convert_task_to_gridded_tnp_args(
         yc_point = yc_grid.reshape(batch_size, -1, yc_grid.shape[-1])
         return xc_point, yc_point
 
-    def target_x_to_tnp(x_t: torch.Tensor) -> torch.Tensor:
+    def target_x_to_tnp(x_t, batch_size: int) -> torch.Tensor:
+        if isinstance(x_t, tuple):
+            xt_grid = grid_x_tuple_to_tnp(x_t, batch_size=batch_size)
+            return xt_grid.reshape(batch_size, -1, xt_grid.shape[-1])
+
+        x_t = _to_torch_float(x_t)
         if x_t.ndim == 2:
             x_t = x_t[None, ...]
         if x_t.ndim != 3:
@@ -1196,12 +1199,12 @@ def convert_task_to_gridded_tnp_args(
         raise ValueError("Task must have target locations (X_t)")
 
     if len(X_t) == 1:
-        xt = target_x_to_tnp(X_t[0])
+        xt = target_x_to_tnp(X_t[0], batch_size=xc.shape[0])
     else:
         # Multiple target sets - need to handle this case
         # For now, just use the first one
         warnings.warn("Multiple target sets detected, using first one only")
-        xt = target_x_to_tnp(X_t[0])
+        xt = target_x_to_tnp(X_t[0], batch_size=xc.shape[0])
 
     if model_variant == "gridded":
         return xc, yc, xt
