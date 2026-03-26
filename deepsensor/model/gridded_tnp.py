@@ -120,28 +120,32 @@ def _compute_grid_range_from_task_loader(
 class GriddedTNP(DeepSensorModel):
     """A Gridded Transformer Neural Process (GriddedTNP) model.
 
-    Wraps around the ``gridded-tnp`` package (``tnp`` module) to construct a GriddedTNP model
-    that uses transformer-based encoders on gridded representations of spatial data.
+    Wraps around the ``gridded-tnp`` package (``tnp`` module) to construct an
+    approximately translation-equivariant GriddedTNP model based on the
+    ``GriddedATETNP`` / ``OOTGGriddedATETNP`` family.
     See: https://github.com/cambridge-mlg/gridded-tnp
 
     **Key Features:**
 
-    - **Transformer Architecture**: Uses self-attention over gridded representations instead of
-      ConvNP's convolutional architecture, which can be more effective for long-range dependencies.
+    - **Approximate Translation Equivariance (default)**: Uses the ATETNP architecture.
+    - **Swin + TE Attention**: Uses gridded TE self-attention and TE cross-attention decoding.
+    - **Configurable Grid Encoder**:
+        - ``'pseudo-token'`` (default): pseudo-token TE grid encoders
+        - ``'kernel-interp'``: SetConv/OOTGSetConv kernel interpolation grid encoders
     - **Two Model Variants**:
-        - ``'gridded'`` (default): Point observations → internal grid → transformer → predictions
-        - ``'ootg'`` (Off-The-Grid): Point + explicit gridded context → transformer → predictions
+        - ``'gridded'`` (default): point observations → internal grid → transformer → predictions
+        - ``'ootg'`` (Off-The-Grid): point + explicit gridded context → transformer → predictions
     - **Efficient**: Processes spatial data on grids rather than all pairwise point interactions.
 
     **Model Variants:**
 
     1. **Gridded (default)**: Best for point-only observations
-        - Encodes point observations onto a fixed internal grid using SetConv
+        - Uses approximately translation-equivariant ATETNP encoding
+        - Supports pseudo-token or kernel-interpolation grid encoders
         - Grid resolution controlled by ``points_per_dim`` (e.g., 32×32)
-        - All context is flattened to points before encoding
 
     2. **OOTG (Off-The-Grid)**: Best for mixed point + gridded context
-        - Handles point observations and gridded context (e.g., satellite imagery) separately
+        - Handles point observations and gridded context separately
         - Preserves spatial structure of gridded data
         - More efficient when gridded context is available
 
@@ -182,10 +186,16 @@ class GriddedTNP(DeepSensorModel):
             Number of transformer layers. Defaults to 6.
         model_variant ({'gridded', 'ootg'}, optional):
             Model architecture variant. Defaults to 'gridded'.
+        grid_encoder_type ({'pseudo-token', 'kernel-interp'}, optional):
+            Grid encoder family. Defaults to 'pseudo-token'.
+        num_fourier (int, optional):
+            Number of Fourier features used by ATETNP basis function module.
+            Defaults to 16.
         points_per_dim (tuple[int, ...], optional):
-            Internal grid resolution (gridded variant only). Defaults to (32, 32) for 2D.
+            Internal grid resolution. Defaults to (32, 32) for 2D.
         grid_range (tuple[tuple[float, float], ...], optional):
-            Spatial bounds for internal grid. Defaults to ((0, 1), (0, 1)) for 2D.
+            Spatial bounds for internal grid and basis domain.
+            Defaults to ((0, 1), (0, 1)) for 2D.
         heteroscedastic (bool, optional):
             Use heteroscedastic (input-dependent) noise. Defaults to True.
         verbose (bool, optional):
@@ -596,23 +606,35 @@ def construct_gridded_tnp(
     z_decoder_num_layers: int = 2,
     z_decoder_width: int = 128,
     model_variant: Literal["gridded", "ootg"] = "gridded",
+    grid_encoder_type: Literal["pseudo-token", "kernel-interp"] = "pseudo-token",
+    num_fourier: int = 16,
+    p_basis_dropout: float = 0.5,
+    top_k_ctot: Optional[int] = None,
+    norm_first: bool = True,
+    window_sizes: Optional[Tuple[int, ...]] = None,
+    shift_sizes: Optional[Tuple[int, ...]] = None,
+    roll_dims: Optional[Tuple[int, ...]] = None,
+    margin: Optional[Tuple[float, ...]] = None,
     likelihood: Literal["normal", "het", "bernoulli-gamma"] = "het",
     **kwargs,
 ):
     """Construct a GriddedTNP model with specified architecture and hyperparameters.
 
-    This function builds a complete GriddedTNP model by assembling encoder, transformer,
-    decoder, and likelihood components. It supports two model variants optimized for
-    different context data structures.
+    This function builds an approximately translation-equivariant GriddedTNP model by
+    assembling ATETNP encoder, Swin/TE transformer, decoder, and likelihood components.
+    It supports both ``gridded`` and ``ootg`` context layouts plus a selectable grid encoder
+    family (pseudo-token or kernel-interpolation).
 
     **Architecture Overview:**
 
-    1. **Encoder**: Projects observations to gridded embeddings
-        - ``'gridded'``: SetConv (point → fixed grid)
-        - ``'ootg'``: OOTGSetConv (point + explicit grid → variable grid)
+    1. **Encoder**: Projects observations to gridded embeddings (ATETNP)
+        - Optional Fourier basis augmentation (controlled by ``num_fourier``)
+        - ``'pseudo-token'``: TE pseudo-token grid encoder
+        - ``'kernel-interp'``: SetConv/OOTGSetConv grid encoder
 
-    2. **Transformer**: GriddedTransformerEncoder with multi-head self-attention
-        - Processes spatial relationships via attention mechanism
+    2. **Transformer**: Swin + TE attention via ``GriddedTransformerEncoder``
+        - TE self-attention over windows
+        - TE cross-attention grid decoder (optionally top-k)
         - ``num_layers`` stacked transformer blocks
 
     3. **Decoder**: TNPDecoder projects transformer outputs to predictions
@@ -625,16 +647,13 @@ def construct_gridded_tnp(
     **Model Variants:**
 
     - ``'gridded'`` (default):
-        - Uses SetConv to encode points onto a fixed internal grid
-        - Grid defined by ``grid_range`` and ``points_per_dim``
-        - Best for: Point-only observations, memory efficiency
-        - Context: Point observations only (gridded context flattened to points)
+        - Point observations on an internal grid
+        - Gridded context is flattened to points in task conversion
+        - Best for: Point-only observations and interpolation
 
     - ``'ootg'`` (Off-The-Grid):
-        - Uses OOTGSetConv for flexible grid handling
-        - Directly incorporates gridded context without flattening
+        - Keeps gridded context explicit (no flattening)
         - Best for: Mixed point + gridded observations (e.g., stations + satellite)
-        - Context: Point observations + explicit gridded context
 
     Args:
         dim_x (int, optional):
@@ -667,9 +686,8 @@ def construct_gridded_tnp(
             Must have length ``dim_x``. Example: ``((0.0, 1.0), (0.0, 1.0))`` for 2D.
             Defaults to unit hypercube ``[(0, 1)] * dim_x``.
         points_per_dim (tuple[int, ...], optional):
-            Grid resolution along each spatial dimension (gridded variant only).
-            Example: ``(32, 32)`` creates a 32×32 grid. Higher resolution increases
-            capacity but also memory/computation. Defaults to ``(32,) * dim_x``.
+            Grid resolution along each spatial dimension.
+            Example: ``(32, 32)`` creates a 32×32 grid. Defaults to ``(32,) * dim_x``.
         init_lengthscale (float, optional):
             Initial lengthscale for SetConv RBF kernels. Controls the spatial extent
             of context influence. Defaults to 0.1.
@@ -695,6 +713,24 @@ def construct_gridded_tnp(
         model_variant ({'gridded', 'ootg'}, optional):
             Model architecture variant. See above for detailed comparison.
             Defaults to 'gridded'.
+        grid_encoder_type ({'pseudo-token', 'kernel-interp'}, optional):
+            Choice of grid encoder family. Defaults to 'pseudo-token'.
+        num_fourier (int, optional):
+            Number of Fourier features for basis augmentation. Defaults to 16.
+        p_basis_dropout (float, optional):
+            Dropout probability applied to basis features. Defaults to 0.5.
+        top_k_ctot (int, optional):
+            Restrict TE cross-attention decoder to nearest grid points. Defaults to None.
+        norm_first (bool, optional):
+            LayerNorm-first transformer blocks. Defaults to True.
+        window_sizes (tuple[int, ...], optional):
+            Swin window sizes per spatial dimension. If None, inferred from ``points_per_dim``.
+        shift_sizes (tuple[int, ...], optional):
+            Swin shift sizes per dimension. If None, inferred from ``window_sizes``.
+        roll_dims (tuple[int, ...], optional):
+            Optional periodic/rolled dimensions for local-neighbour operations.
+        margin (tuple[float, ...], optional):
+            Optional margin for pseudo-token TE grid extent in gridded mode.
         likelihood ({'normal', 'het', 'bernoulli-gamma'}, optional):
             Likelihood function for the model:
             
@@ -708,7 +744,7 @@ def construct_gridded_tnp(
 
     Returns:
         tuple[torch.nn.Module, dict]: A tuple containing:
-            - **model**: GriddedTNP or OOTGGriddedTNP PyTorch module
+            - **model**: GriddedATETNP or OOTGGriddedATETNP PyTorch module
             - **config**: Dictionary of all hyperparameters for reproducibility/saving
 
     Raises:
@@ -759,6 +795,11 @@ def construct_gridded_tnp(
         raise ValueError(
             f"model_variant must be one of ['gridded', 'ootg'], got {model_variant!r}"
         )
+    if grid_encoder_type not in ["pseudo-token", "kernel-interp"]:
+        raise ValueError(
+            "grid_encoder_type must be one of ['pseudo-token', 'kernel-interp'], "
+            f"got {grid_encoder_type!r}"
+        )
 
     if isinstance(dim_yc, (tuple, list)):
         dim_yc_values = tuple(int(d) for d in dim_yc)
@@ -797,7 +838,7 @@ def construct_gridded_tnp(
     if points_per_dim is None:
         points_per_dim = tuple(32 for _ in range(dim_x))
     else:
-        points_per_dim = tuple(points_per_dim)
+        points_per_dim = tuple(int(v) for v in points_per_dim)
 
     if len(grid_range) != dim_x:
         raise ValueError(
@@ -813,14 +854,25 @@ def construct_gridded_tnp(
             HeteroscedasticNormalLikelihood,
             NormalLikelihood,
         )
-        from tnp.models.gridded_tnp import GriddedTNP as TNPGriddedTNP
-        from tnp.models.gridded_tnp import GriddedTNPEncoder
-        from tnp.models.gridded_tnp import OOTGGriddedTNP, OOTGGriddedTNPEncoder
+        from tnp.models.gridded_atetnp import GriddedATETNP
+        from tnp.models.gridded_atetnp import GriddedATETNPEncoder
+        from tnp.models.gridded_atetnp import OOTGGriddedATETNP
+        from tnp.models.gridded_atetnp import OOTGGriddedATETNPEncoder
         from tnp.models.tnp import TNPDecoder
-        from tnp.networks.attention_layers import MultiHeadSelfAttentionLayer
-        from tnp.networks.grid_decoders import SetConvGridDecoder
-        from tnp.networks.grid_encoders import OOTGSetConv, SetConv
+        from tnp.networks.grid_encoders import (
+            OOTGPseudoTokenTEGridEncoder,
+            OOTGSetConv,
+            PseudoTokenTEGridEncoder,
+            SetConv,
+        )
         from tnp.networks.mlp import MLP
+        from tnp.networks.modules import ModuleOnFourierExpandedInput
+        from tnp.networks.swin_attention import SWINAttentionLayer
+        from tnp.networks.te_grid_decoders import TEMHCAGridDecoder
+        from tnp.networks.teattention_layers import (
+            GriddedMultiHeadSelfTEAttentionLayer,
+            MultiHeadCrossTEAttentionLayer,
+        )
         from tnp.networks.transformer import GriddedTransformerEncoder
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
@@ -834,61 +886,169 @@ def construct_gridded_tnp(
     except ImportError:
         BernoulliGammaLikelihood = None
 
-    xy_in_dim = dim_x + dim_yc_point + 1
-    xy_encoder = MLP(
-        in_dim=xy_in_dim,
+    y_encoder = MLP(
+        in_dim=dim_yc_point + 1,
         out_dim=d_model,
         num_layers=xy_encoder_num_layers,
         width=xy_encoder_width,
     )
 
-    if model_variant == "gridded":
-        grid_encoder = SetConv(
-            dims=dim_x,
-            grid_range=grid_range,
-            points_per_dim=points_per_dim,
-            init_lengthscale=init_lengthscale,
-        )
+    if window_sizes is None:
+        window_sizes = tuple(max(1, min(4, int(points))) for points in points_per_dim)
     else:
-        grid_encoder = OOTGSetConv(
-            dims=dim_x,
-            init_lengthscale=init_lengthscale,
+        window_sizes = tuple(int(v) for v in window_sizes)
+    if len(window_sizes) != dim_x:
+        raise ValueError(
+            f"window_sizes must have length dim_x={dim_x}, got {len(window_sizes)}"
         )
 
-    mhsa_layer = MultiHeadSelfAttentionLayer(
+    if shift_sizes is None:
+        shift_sizes = tuple(0 if w <= 1 else w // 2 for w in window_sizes)
+    else:
+        shift_sizes = tuple(int(v) for v in shift_sizes)
+    if len(shift_sizes) != dim_x:
+        raise ValueError(
+            f"shift_sizes must have length dim_x={dim_x}, got {len(shift_sizes)}"
+        )
+
+    if roll_dims is not None:
+        roll_dims = tuple(int(d) for d in roll_dims)
+
+    if margin is not None:
+        margin = tuple(float(m) for m in margin)
+        if len(margin) != dim_x:
+            raise ValueError(f"margin must have length dim_x={dim_x}, got {len(margin)}")
+
+    mhca_kernel_decoder = MLP(
+        in_dim=dim_x,
+        out_dim=num_heads,
+        num_layers=2,
+        width=num_heads,
+    )
+    te_mhca_layer = MultiHeadCrossTEAttentionLayer(
         embed_dim=d_model,
         num_heads=num_heads,
         head_dim=head_dim,
+        feedforward_dim=d_model,
+        norm_first=norm_first,
+        p_dropout=p_dropout,
+        kernel=mhca_kernel_decoder,
+    )
+    grid_decoder = TEMHCAGridDecoder(
+        mhca_layer=te_mhca_layer,
+        top_k_ctot=top_k_ctot,
+        roll_dims=roll_dims,
+    )
+    mhsa_layer = GriddedMultiHeadSelfTEAttentionLayer(
+        embed_dim=d_model,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        grid_shape=window_sizes,
+        feedforward_dim=d_model,
+        norm_first=norm_first,
         p_dropout=p_dropout,
     )
-    grid_decoder = SetConvGridDecoder(
-        dim=dim_x,
-        init_lengthscale=init_lengthscale,
+    swin_layer = SWINAttentionLayer(
+        mhsa_layer=mhsa_layer,
+        window_sizes=window_sizes,
+        shift_sizes=shift_sizes,
+        roll_dims=roll_dims,
     )
     transformer_encoder = GriddedTransformerEncoder(
         num_layers=num_layers,
         grid_decoder=grid_decoder,
-        mhsa_layer=mhsa_layer,
+        mhsa_layer=swin_layer,
     )
 
+    basis_fn_mlp = MLP(
+        in_dim=dim_x * num_fourier,
+        out_dim=d_model,
+        num_layers=2,
+        width=d_model,
+    )
+    basis_fn = ModuleOnFourierExpandedInput(
+        module=basis_fn_mlp,
+        x_range=grid_range,
+        num_fourier=num_fourier,
+    )
+
+    if grid_encoder_type == "pseudo-token":
+        mhca_kernel_encoder = MLP(
+            in_dim=dim_x,
+            out_dim=num_heads,
+            num_layers=2,
+            width=num_heads,
+        )
+        grid_encoder_te_mhca_layer = MultiHeadCrossTEAttentionLayer(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            feedforward_dim=d_model,
+            norm_first=norm_first,
+            p_dropout=p_dropout,
+            kernel=mhca_kernel_encoder,
+        )
+
+        if model_variant == "gridded":
+            points_per_unit_dim = []
+            for axis, bounds in enumerate(grid_range):
+                axis_range = float(bounds[1] - bounds[0])
+                if axis_range <= 0:
+                    raise ValueError(
+                        f"grid_range[{axis}] has non-positive span {axis_range}; cannot derive points_per_unit_dim."
+                    )
+                ppu = max(1, int(round(points_per_dim[axis] / axis_range)))
+                points_per_unit_dim.append(ppu)
+
+            grid_encoder = PseudoTokenTEGridEncoder(
+                embed_dim=d_model,
+                mhca_layer=grid_encoder_te_mhca_layer,
+                points_per_unit_dim=tuple(points_per_unit_dim),
+                margin=margin,
+            )
+        else:
+            grid_encoder = OOTGPseudoTokenTEGridEncoder(
+                embed_dim=d_model,
+                mhca_layer=grid_encoder_te_mhca_layer,
+                grid_shape=points_per_dim,
+            )
+    else:
+        if model_variant == "gridded":
+            grid_encoder = SetConv(
+                dims=dim_x,
+                grid_range=grid_range,
+                points_per_dim=points_per_dim,
+                init_lengthscale=init_lengthscale,
+            )
+        else:
+            grid_encoder = OOTGSetConv(
+                dims=dim_x,
+                grid_shape=points_per_dim,
+                init_lengthscale=init_lengthscale,
+            )
+
     if model_variant == "gridded":
-        encoder = GriddedTNPEncoder(
-            transformer_encoder=transformer_encoder,
+        encoder = GriddedATETNPEncoder(
+            tetransformer_encoder=transformer_encoder,
             grid_encoder=grid_encoder,
-            xy_encoder=xy_encoder,
+            y_encoder=y_encoder,
+            basis_fn=basis_fn,
+            p_basis_dropout=p_basis_dropout,
         )
     else:
-        xy_grid_encoder = MLP(
-            in_dim=dim_x + dim_yc_grid,
+        y_grid_encoder = MLP(
+            in_dim=dim_yc_grid,
             out_dim=d_model,
             num_layers=xy_encoder_num_layers,
             width=xy_encoder_width,
         )
-        encoder = OOTGGriddedTNPEncoder(
-            transformer_encoder=transformer_encoder,
+        encoder = OOTGGriddedATETNPEncoder(
+            tetransformer_encoder=transformer_encoder,
             grid_encoder=grid_encoder,
-            xy_encoder=xy_encoder,
-            xy_grid_encoder=xy_grid_encoder,
+            y_encoder=y_encoder,
+            y_grid_encoder=y_grid_encoder,
+            basis_fn=basis_fn,
+            p_basis_dropout=p_basis_dropout,
         )
 
     # Determine likelihood output dimension and construct likelihood object
@@ -922,19 +1082,20 @@ def construct_gridded_tnp(
     decoder = TNPDecoder(z_decoder=z_decoder)
 
     if model_variant == "gridded":
-        model = TNPGriddedTNP(
+        model = GriddedATETNP(
             encoder=encoder,
             decoder=decoder,
             likelihood=likelihood_obj,
         )
     else:
-        model = OOTGGriddedTNP(
+        model = OOTGGriddedATETNP(
             encoder=encoder,
             decoder=decoder,
             likelihood=likelihood_obj,
         )
 
     model = model.float()
+    model._deepsensor_model_variant = model_variant
 
     config = {
         "dim_x": dim_x,
@@ -957,6 +1118,15 @@ def construct_gridded_tnp(
         "z_decoder_num_layers": z_decoder_num_layers,
         "z_decoder_width": z_decoder_width,
         "model_variant": model_variant,
+        "grid_encoder_type": grid_encoder_type,
+        "num_fourier": num_fourier,
+        "p_basis_dropout": p_basis_dropout,
+        "top_k_ctot": top_k_ctot,
+        "norm_first": norm_first,
+        "window_sizes": list(window_sizes),
+        "shift_sizes": list(shift_sizes),
+        "roll_dims": None if roll_dims is None else list(roll_dims),
+        "margin": None if margin is None else list(margin),
         "likelihood": likelihood,
     }
     return model, config
@@ -979,8 +1149,11 @@ def run_gridded_tnp_model(
     Returns:
         Distribution: The model's output distribution.
     """
+
     # Convert task to GriddedTNP format
-    model_variant = "ootg" if model.__class__.__name__ == "OOTGGriddedTNP" else "gridded"
+    model_variant = getattr(model, "_deepsensor_model_variant", None)
+    if model_variant is None:
+        model_variant = "ootg" if "OOTG" in model.__class__.__name__ else "gridded"
     model_args = convert_task_to_gridded_tnp_args(task, model_variant=model_variant)
 
     # Convert all tensors to float32 for consistency with model
