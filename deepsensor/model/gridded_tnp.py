@@ -1150,10 +1150,13 @@ def run_gridded_tnp_model(
         Distribution: The model's output distribution.
     """
 
-    # Convert task to GriddedTNP format
-    model_variant = getattr(model, "_deepsensor_model_variant", None)
+    # Convert task to GriddedTNP format.
+    # DataParallel wraps the underlying module, so inspect `.module` first for
+    # DeepSensor-specific attributes like `_deepsensor_model_variant`.
+    model_for_config = model.module if hasattr(model, "module") else model
+    model_variant = getattr(model_for_config, "_deepsensor_model_variant", None)
     if model_variant is None:
-        model_variant = "ootg" if "OOTG" in model.__class__.__name__ else "gridded"
+        model_variant = "ootg" if "OOTG" in model_for_config.__class__.__name__ else "gridded"
     model_args = convert_task_to_gridded_tnp_args(task, model_variant=model_variant)
 
     # Convert all tensors to float32 for consistency with model
@@ -1164,12 +1167,55 @@ def run_gridded_tnp_model(
 
     model_args = tuple(_to_float32(arg) for arg in model_args)
 
+    def _resolve_output_device(dp_model: torch.nn.DataParallel):
+        out_dev = dp_model.output_device
+        if isinstance(out_dev, torch.device):
+            return out_dev
+        if isinstance(out_dev, int):
+            return torch.device(f"cuda:{out_dev}")
+        return torch.device(out_dev)
+
+    def _merge_parallel_outputs(outputs, output_device):
+        first = outputs[0]
+        # torch.distributions.Distribution-like outputs are handled by DataParallel.gather.
+        # Custom BernoulliGammaDistribution needs explicit concatenation along batch dim.
+        if all(
+            hasattr(o, "probs") and hasattr(o, "shape") and hasattr(o, "rate")
+            for o in outputs
+        ):
+            probs = torch.cat([o.probs.to(output_device) for o in outputs], dim=0)
+            shape = torch.cat([o.shape.to(output_device) for o in outputs], dim=0)
+            rate = torch.cat([o.rate.to(output_device) for o in outputs], dim=0)
+            return type(first)(probs, shape, rate)
+
+        raise TypeError(
+            f"Unsupported DataParallel output type for custom gather: {type(first).__name__}"
+        )
+
+    def _forward_model():
+        if not isinstance(model, torch.nn.DataParallel):
+            return model(*model_args)
+
+        # DataParallel's default gather fails for custom distribution objects,
+        # so run scatter/replicate/apply manually and merge custom outputs.
+        inputs, kwargs = model.scatter(model_args, {}, model.device_ids)
+        if len(inputs) == 1:
+            return model.module(*inputs[0], **kwargs[0])
+
+        replicas = model.replicate(model.module, model.device_ids[: len(inputs)])
+        outputs = model.parallel_apply(replicas, inputs, kwargs)
+        output_device = _resolve_output_device(model)
+        try:
+            return model.gather(outputs, output_device)
+        except TypeError:
+            return _merge_parallel_outputs(outputs, output_device)
+
     # Run forward pass with or without gradients
     if not requires_grad:
         with torch.no_grad():
-            dist = model(*model_args)
+            dist = _forward_model()
     else:
-        dist = model(*model_args)
+        dist = _forward_model()
 
     return dist
 
@@ -1180,12 +1226,16 @@ def _to_torch_float(value) -> torch.Tensor:
 
     if hasattr(value, "y") and hasattr(value, "mask"):
         value = value.y
+    if torch.is_tensor(value):
+        return value.float()
 
     if isinstance(value, np.ma.MaskedArray):
         value = value.filled(np.nan)
 
     if hasattr(value, "data") and not isinstance(value, np.ndarray):
         value = value.data
+    if torch.is_tensor(value):
+        return value.float()
 
     arr = np.asarray(value)
     if arr.dtype == np.object_:

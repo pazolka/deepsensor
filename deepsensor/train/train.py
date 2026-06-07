@@ -153,7 +153,7 @@ class Trainer:
         lr (float): Learning rate
     """
 
-    def __init__(self, model: ConvNP, lr: float = 5e-5):
+    def __init__(self, model: ConvNP, lr: float = 5e-5, weight_decay: float = 0.0):
         if deepsensor.backend.str == "tf":
             import tensorflow as tf
 
@@ -161,7 +161,7 @@ class Trainer:
         elif deepsensor.backend.str == "torch":
             import torch.optim as optim
 
-            self.opt = optim.Adam(model.model.parameters(), lr=lr)
+            self.opt = optim.Adam(model.model.parameters(), lr=lr, weight_decay=weight_decay)
 
         self.model = model
 
