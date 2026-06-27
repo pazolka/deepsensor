@@ -504,7 +504,7 @@ class GriddedTNP(DeepSensorModel):
         return self.sample(dist, n_samples)
 
     @dispatch
-    def logpdf(self, dist, task: Task):
+    def logpdf(self, dist, task: Task, normalise: bool = False):
         """Compute log probability density.
 
         Args:
@@ -515,14 +515,21 @@ class GriddedTNP(DeepSensorModel):
             torch.Tensor: The log probability density (scalar, averaged over batch).
         """
         task = GriddedTNP.modify_task(task)
-        # task["Y_t"] is a list with one element: the batch tensor
-        # We extract it to get shape [batch, n_targets, dim_yt]
-        Y_t = task["Y_t"][0]
-        # Compute log prob and average over batch
-        return dist.log_prob(Y_t).mean()
+        model_args = convert_task_to_gridded_tnp_args(
+            task,
+            model_variant=self.config.get("model_variant", "gridded"),
+            dim_x=self.config.get("dim_x"),
+        )
+        xt = model_args[-1]
+        y_t = target_y_to_gridded_tnp(task["Y_t"][0], n_points=xt.shape[1])
+        log_prob = dist.log_prob(y_t)
+        logpdf = log_prob.sum(dim=tuple(range(1, log_prob.ndim)))
+        if normalise:
+            logpdf = logpdf / torch.isfinite(y_t).sum(dim=tuple(range(1, y_t.ndim))).clamp_min(1)
+        return logpdf.mean()
 
     @dispatch
-    def logpdf(self, task: Task):
+    def logpdf(self, task: Task, normalise: bool = False):
         """Compute log probability density.
 
         Args:
@@ -532,9 +539,9 @@ class GriddedTNP(DeepSensorModel):
             float: The log probability density.
         """
         dist = self(task, requires_grad=True)
-        return self.logpdf(dist, task)
+        return self.logpdf(dist, task, normalise=normalise)
 
-    def loss_fn(self, task: Task, **kwargs):
+    def loss_fn(self, task: Task, normalise: bool = True, **kwargs):
         """Compute the loss of a task.
 
         Args:
@@ -543,7 +550,7 @@ class GriddedTNP(DeepSensorModel):
         Returns:
             float: The loss (negative log probability).
         """
-        return -self.logpdf(task)
+        return -self.logpdf(task, normalise=normalise)
 
     # Optional: implement entropy, covariance methods if needed
     def mean_marginal_entropy(self, task: Task):
@@ -1096,6 +1103,8 @@ def construct_gridded_tnp(
 
     model = model.float()
     model._deepsensor_model_variant = model_variant
+    model._deepsensor_dim_x = dim_x
+    model._deepsensor_dim_yt = dim_yt
 
     config = {
         "dim_x": dim_x,
@@ -1154,7 +1163,11 @@ def run_gridded_tnp_model(
     model_variant = getattr(model, "_deepsensor_model_variant", None)
     if model_variant is None:
         model_variant = "ootg" if "OOTG" in model.__class__.__name__ else "gridded"
-    model_args = convert_task_to_gridded_tnp_args(task, model_variant=model_variant)
+    model_args = convert_task_to_gridded_tnp_args(
+        task,
+        model_variant=model_variant,
+        dim_x=getattr(model, "_deepsensor_dim_x", None),
+    )
 
     # Convert all tensors to float32 for consistency with model
     def _to_float32(x):
@@ -1197,9 +1210,27 @@ def _to_torch_float(value) -> torch.Tensor:
     return torch.as_tensor(arr).float()
 
 
+def target_y_to_gridded_tnp(y: torch.Tensor, n_points: int) -> torch.Tensor:
+    """Convert DeepSensor target observations to ``[batch, n_points, dim_y]``."""
+    y = _to_torch_float(y)
+    if y.ndim == 2:
+        y = y[None, ...]
+    if y.ndim != 3:
+        raise ValueError(f"Expected target Y with ndim 2 or 3, got shape {tuple(y.shape)}")
+    if y.shape[1] == n_points:
+        return y
+    if y.shape[2] == n_points:
+        return y.transpose(1, 2)
+    raise ValueError(
+        "Could not align target Y with target X: "
+        f"Y shape {tuple(y.shape)} does not contain n_points={n_points}."
+    )
+
+
 def convert_task_to_gridded_tnp_args(
     task: Task,
     model_variant: Literal["gridded", "ootg"] = "gridded",
+    dim_x: Optional[int] = None,
 ):
     """Convert DeepSensor Task to GriddedTNP format.
 
@@ -1222,24 +1253,36 @@ def convert_task_to_gridded_tnp_args(
         )
 
     def point_x_to_tnp(x: torch.Tensor) -> torch.Tensor:
+        x = _to_torch_float(x)
         if x.ndim == 2:
             x = x[None, ...]
         if x.ndim != 3:
             raise ValueError(f"Expected point X with ndim 2 or 3, got shape {tuple(x.shape)}")
-        # DeepSensor convention is typically (batch, dim_x, n_points)
+        if dim_x is not None:
+            if x.shape[-1] == dim_x:
+                return x
+            if x.shape[1] == dim_x:
+                return x.transpose(1, 2)
+        # DeepSensor convention is typically (batch, dim_x, n_points). Fall back
+        # to that convention when the spatial dimension was not supplied.
         if x.shape[1] <= x.shape[2]:
             return x.transpose(1, 2)
         return x
 
-    def point_y_to_tnp(y: torch.Tensor) -> torch.Tensor:
+    def point_y_to_tnp(y: torch.Tensor, n_points: int) -> torch.Tensor:
         y = _to_torch_float(y)
         if y.ndim == 2:
             y = y[None, ...]
         if y.ndim != 3:
             raise ValueError(f"Expected point Y with ndim 2 or 3, got shape {tuple(y.shape)}")
-        if y.shape[1] <= y.shape[2]:
+        if y.shape[1] == n_points:
+            return y
+        if y.shape[2] == n_points:
             return y.transpose(1, 2)
-        return y
+        raise ValueError(
+            "Could not align point Y with point X: "
+            f"Y shape {tuple(y.shape)} does not contain n_points={n_points}."
+        )
 
     def grid_y_to_tnp(y_grid: torch.Tensor) -> torch.Tensor:
         y_grid = _to_torch_float(y_grid)
@@ -1340,8 +1383,9 @@ def convert_task_to_gridded_tnp_args(
             else:
                 gridded_contexts.append((xc_grid, yc_grid))
         else:
-            point_xc.append(point_x_to_tnp(x_ci))
-            point_yc.append(point_y_to_tnp(y_ci))
+            xc_point = point_x_to_tnp(x_ci)
+            point_xc.append(xc_point)
+            point_yc.append(point_y_to_tnp(y_ci, n_points=xc_point.shape[1]))
 
     if len(point_xc) == 0:
         if model_variant == "gridded":
