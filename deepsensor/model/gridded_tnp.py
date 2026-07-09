@@ -322,12 +322,14 @@ class GriddedTNP(DeepSensorModel):
             kwargs["init_lengthscale"] = init_lengthscale
 
         self.model, self.config = construct_gridded_tnp(*args, **kwargs)
+        self._set_num_mixture_components()
 
     @dispatch
     def __init__(self, model_ID: str):
         """Instantiate a model from a folder containing model weights and config."""
         super().__init__()
         self.load(model_ID)
+        self._set_num_mixture_components()
 
     @dispatch
     def __init__(
@@ -339,6 +341,14 @@ class GriddedTNP(DeepSensorModel):
         """Instantiate a model from a folder with data processor and task loader."""
         super().__init__(data_processor, task_loader)
         self.load(model_ID)
+        self._set_num_mixture_components()
+
+    def _set_num_mixture_components(self):
+        """Set the number of mixture components for the model likelihood."""
+        if self.config.get("likelihood") == "bernoulli-gamma":
+            self.N_mixture_components = 2
+        else:
+            self.N_mixture_components = 1
 
     def save(self, model_ID: str):
         """Save the model weights and config to a folder.
@@ -367,7 +377,7 @@ class GriddedTNP(DeepSensorModel):
         self.model.load_state_dict(torch.load(os.path.join(model_ID, "model.pt")))
 
     @classmethod
-    def modify_task(cls, task: Task):
+    def modify_task(cls, task: Task, convert_to_tensor: bool = True):
         """Prepare task for GriddedTNP model (add batch dim, convert to tensor, etc.).
 
         Args:
@@ -382,7 +392,7 @@ class GriddedTNP(DeepSensorModel):
             task = task.cast_to_float32()
         if "numpy_mask" not in task["ops"]:
             task = task.mask_nans_numpy()
-        if "tensor" not in task["ops"]:
+        if convert_to_tensor and "tensor" not in task["ops"]:
             task = task.convert_to_tensor()
 
         return task
@@ -483,6 +493,70 @@ class GriddedTNP(DeepSensorModel):
         return self.std(dist)
 
     @dispatch
+    def k(self, dist):
+        """Gamma shape values for Bernoulli-Gamma likelihoods."""
+        if self.config.get("likelihood") != "bernoulli-gamma":
+            raise NotImplementedError(
+                f"GriddedTNP.k method not supported for likelihood {self.config.get('likelihood')}. "
+                f"Valid likelihoods: 'bernoulli-gamma'."
+            )
+        if not hasattr(dist, "shape"):
+            raise AttributeError("Bernoulli-Gamma distribution does not expose a shape attribute")
+        k = self._cast_numpy_and_squeeze(dist.shape)
+        return self._normalise_prediction_shape(k)
+
+    @dispatch
+    def k(self, task: Task):
+        """Gamma shape values at target locations."""
+        dist = self(task)
+        return self.k(dist)
+
+    @dispatch
+    def scale(self, dist):
+        """Gamma scale values for Bernoulli-Gamma likelihoods."""
+        if self.config.get("likelihood") != "bernoulli-gamma":
+            raise NotImplementedError(
+                f"GriddedTNP.scale method not supported for likelihood {self.config.get('likelihood')}. "
+                f"Valid likelihoods: 'bernoulli-gamma'."
+            )
+        if not hasattr(dist, "rate"):
+            raise AttributeError("Bernoulli-Gamma distribution does not expose a rate attribute")
+        scale = 1.0 / dist.rate.clamp_min(1e-12)
+        scale = self._cast_numpy_and_squeeze(scale)
+        return self._normalise_prediction_shape(scale)
+
+    @dispatch
+    def scale(self, task: Task):
+        """Gamma scale values at target locations."""
+        dist = self(task)
+        return self.scale(dist)
+
+    @dispatch
+    def mixture_probs(self, dist):
+        """Dry/wet mixture probabilities for Bernoulli-Gamma likelihoods."""
+        if self.N_mixture_components == 1:
+            raise NotImplementedError(
+                f"mixture_probs not supported if model attribute N_mixture_components == 1. "
+                f"Try changing the likelihood to a mixture model, e.g. 'bernoulli-gamma'."
+            )
+        if self.config.get("likelihood") != "bernoulli-gamma":
+            raise NotImplementedError(
+                f"GriddedTNP.mixture_probs method not supported for likelihood {self.config.get('likelihood')}. "
+                f"Valid likelihoods: 'bernoulli-gamma'."
+            )
+        if not hasattr(dist, "probs"):
+            raise AttributeError("Bernoulli-Gamma distribution does not expose a probs attribute")
+        wet_probs = self._cast_numpy_and_squeeze(dist.probs)
+        wet_probs = self._normalise_prediction_shape(wet_probs)
+        return np.stack([1.0 - wet_probs, wet_probs], axis=0)
+
+    @dispatch
+    def mixture_probs(self, task: Task):
+        """Dry/wet mixture probabilities at target locations."""
+        dist = self(task)
+        return self.mixture_probs(dist)
+
+    @dispatch
     def sample(self, dist, n_samples: int = 1):
         """Draw samples from GriddedTNP distribution."""
         samples = dist.sample((n_samples,))
@@ -514,6 +588,7 @@ class GriddedTNP(DeepSensorModel):
         Returns:
             torch.Tensor: The log probability density (scalar, averaged over batch).
         """
+        target_task = GriddedTNP.modify_task(task, convert_to_tensor=False)
         task = GriddedTNP.modify_task(task)
         model_args = convert_task_to_gridded_tnp_args(
             task,
@@ -521,11 +596,14 @@ class GriddedTNP(DeepSensorModel):
             dim_x=self.config.get("dim_x"),
         )
         xt = model_args[-1]
-        y_t = target_y_to_gridded_tnp(task["Y_t"][0], n_points=xt.shape[1])
+        y_t, observed = target_y_and_mask_to_gridded_tnp(target_task["Y_t"][0], n_points=xt.shape[1])
+        observed = observed.to(device=xt.device)
+        y_t = y_t.to(device=xt.device)
         log_prob = dist.log_prob(y_t)
+        log_prob = torch.where(observed, log_prob, torch.zeros_like(log_prob))
         logpdf = log_prob.sum(dim=tuple(range(1, log_prob.ndim)))
         if normalise:
-            logpdf = logpdf / torch.isfinite(y_t).sum(dim=tuple(range(1, y_t.ndim))).clamp_min(1)
+            logpdf = logpdf / observed.sum(dim=tuple(range(1, observed.ndim))).clamp_min(1)
         return logpdf.mean()
 
     @dispatch
@@ -1210,21 +1288,48 @@ def _to_torch_float(value) -> torch.Tensor:
     return torch.as_tensor(arr).float()
 
 
-def target_y_to_gridded_tnp(y: torch.Tensor, n_points: int) -> torch.Tensor:
-    """Convert DeepSensor target observations to ``[batch, n_points, dim_y]``."""
-    y = _to_torch_float(y)
+def _align_target_tensor_to_gridded_tnp(y: torch.Tensor, n_points: int, *, name: str) -> torch.Tensor:
     if y.ndim == 2:
         y = y[None, ...]
     if y.ndim != 3:
-        raise ValueError(f"Expected target Y with ndim 2 or 3, got shape {tuple(y.shape)}")
+        raise ValueError(f"Expected {name} with ndim 2 or 3, got shape {tuple(y.shape)}")
     if y.shape[1] == n_points:
         return y
     if y.shape[2] == n_points:
         return y.transpose(1, 2)
     raise ValueError(
-        "Could not align target Y with target X: "
-        f"Y shape {tuple(y.shape)} does not contain n_points={n_points}."
+        f"Could not align {name} with target X: "
+        f"shape {tuple(y.shape)} does not contain n_points={n_points}."
     )
+
+
+def target_y_and_mask_to_gridded_tnp(y, n_points: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert target observations and masks to GriddedTNP target layout.
+
+    Returns:
+        tuple: ``(y, observed)`` tensors with shape ``[batch, n_points, dim_y]``.
+        ``observed`` is True where the target should contribute to logpdf.
+    """
+    if isinstance(y, np.ma.MaskedArray):
+        observed = torch.as_tensor(~np.ma.getmaskarray(y)).bool()
+        values = torch.as_tensor(y.filled(0.0)).float()
+    elif hasattr(y, "y") and hasattr(y, "mask"):
+        values = _to_torch_float(y.y)
+        observed = torch.as_tensor(y.mask).bool()
+    else:
+        values = _to_torch_float(y)
+        observed = torch.isfinite(values)
+        values = torch.nan_to_num(values, nan=0.0)
+
+    values = _align_target_tensor_to_gridded_tnp(values, n_points, name="target Y")
+    observed = _align_target_tensor_to_gridded_tnp(observed, n_points, name="target mask").bool()
+    return values, observed
+
+
+def target_y_to_gridded_tnp(y: torch.Tensor, n_points: int) -> torch.Tensor:
+    """Convert DeepSensor target observations to ``[batch, n_points, dim_y]``."""
+    y, _ = target_y_and_mask_to_gridded_tnp(y, n_points)
+    return y
 
 
 def convert_task_to_gridded_tnp_args(
