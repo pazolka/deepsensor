@@ -117,6 +117,32 @@ def _compute_grid_range_from_task_loader(
         return tuple(x1_bounds for _ in range(dim_x))
 
 
+def _count_gridded_context_sets(task_loader: TaskLoader) -> int:
+    """Count the leading gridded (xarray-backed) context sets in a ``TaskLoader``.
+
+    The ``ootg`` variant requires its gridded context sets first, so counting stops at the first
+    non-xarray entry. Uses the same xarray-vs-pandas distinction as
+    :meth:`TaskLoader.count_context_and_target_data_dims`, which is what produces ``dim_yc`` --
+    the two must agree for the ``dim_yc[:n]``/``dim_yc[n:]`` split to be meaningful.
+
+    Returns:
+        int: Number of leading gridded context sets (0 if none).
+    """
+    import xarray as xr
+
+    context = task_loader.context
+    if not isinstance(context, (tuple, list)):
+        context = [context]
+
+    n_gridded = 0
+    for context_set in context:
+        if isinstance(context_set, (xr.Dataset, xr.DataArray)):
+            n_gridded += 1
+        else:
+            break
+    return n_gridded
+
+
 class GriddedTNP(DeepSensorModel):
     """A Gridded Transformer Neural Process (GriddedTNP) model.
 
@@ -283,6 +309,15 @@ class GriddedTNP(DeepSensorModel):
                 print(f"dim_aux_t inferred from TaskLoader: {dim_aux_t}")
             kwargs["dim_aux_t"] = dim_aux_t
 
+        if "num_gridded_contexts" not in kwargs:
+            num_gridded_contexts = _count_gridded_context_sets(task_loader)
+            if verbose:
+                print(
+                    "num_gridded_contexts inferred from TaskLoader: "
+                    f"{num_gridded_contexts}"
+                )
+            kwargs["num_gridded_contexts"] = num_gridded_contexts
+
         # Infer grid parameters from data
         if "points_per_dim" not in kwargs:
             # Compute data density and use it to set grid resolution
@@ -392,6 +427,13 @@ class GriddedTNP(DeepSensorModel):
             task = task.cast_to_float32()
         if "numpy_mask" not in task["ops"]:
             task = task.mask_nans_numpy()
+        if "nps_mask" not in task["ops"]:
+            # Without this the grid's ``np.ma.MaskedArray`` reaches ``convert_to_tensor``, which
+            # drops the mask -- the NaN cells then survive as real (zero-filled) observations.
+            # ``mask_nans_nps`` collapses each context set's channels to one flag *per set*
+            # (``Task.op`` applies it once per set), which is the granularity the gridded encoder
+            # wants: one density channel per set.
+            task = task.mask_nans_nps()
         if convert_to_tensor and "tensor" not in task["ops"]:
             task = task.convert_to_tensor()
 
@@ -675,6 +717,7 @@ def construct_gridded_tnp(
     dim_yc: int = 1,
     dim_yt: int = 1,
     dim_aux_t: Optional[int] = None,
+    num_gridded_contexts: int = 1,
     d_model: int = 128,
     num_heads: int = 8,
     num_layers: int = 6,
@@ -886,12 +929,27 @@ def construct_gridded_tnp(
             f"got {grid_encoder_type!r}"
         )
 
+    if num_gridded_contexts < 0:
+        raise ValueError(
+            f"num_gridded_contexts must be >= 0, got {num_gridded_contexts}"
+        )
+    if model_variant == "ootg" and num_gridded_contexts < 1:
+        raise ValueError(
+            "model_variant='ootg' requires at least one gridded context set, but "
+            "num_gridded_contexts=0. Pass a TaskLoader with an xarray context set, or set "
+            "num_gridded_contexts explicitly."
+        )
+    num_gridded_contexts = int(num_gridded_contexts)
+
     if isinstance(dim_yc, (tuple, list)):
         dim_yc_values = tuple(int(d) for d in dim_yc)
         dim_yc_total = int(sum(dim_yc_values))
-        if model_variant == "ootg" and len(dim_yc_values) >= 2:
-            dim_yc_grid = int(dim_yc_values[0])
-            dim_yc_point = int(sum(dim_yc_values[1:]))
+        if model_variant == "ootg" and len(dim_yc_values) > num_gridded_contexts:
+            # The first ``num_gridded_contexts`` sets are the gridded ones (ootg requires them
+            # first); the rest are point sets. With the default of 1 this reproduces the legacy
+            # "the first set is the grid" behaviour exactly.
+            dim_yc_grid = int(sum(dim_yc_values[:num_gridded_contexts]))
+            dim_yc_point = int(sum(dim_yc_values[num_gridded_contexts:]))
         else:
             dim_yc_grid = dim_yc_total
             dim_yc_point = dim_yc_total
@@ -1121,8 +1179,13 @@ def construct_gridded_tnp(
             p_basis_dropout=p_basis_dropout,
         )
     else:
+        # Each gridded context set contributes one extra *density* channel alongside its
+        # observed values: ``[mask_i, values_i, ...]``. So the encoder input is
+        # ``dim_yc_grid + num_gridded_contexts`` wide, not ``dim_yc_grid``. The density channels
+        # are built in :func:`convert_task_to_gridded_tnp_args`; the two must agree, which is
+        # why both read the same ``num_gridded_contexts``.
         y_grid_encoder = MLP(
-            in_dim=dim_yc_grid,
+            in_dim=dim_yc_grid + num_gridded_contexts,
             out_dim=d_model,
             num_layers=xy_encoder_num_layers,
             width=xy_encoder_width,
@@ -1189,6 +1252,9 @@ def construct_gridded_tnp(
         "dim_yc": dim_yc,
         "dim_yt": dim_yt,
         "dim_aux_t": dim_aux_t,
+        # Persisted so ``GriddedTNP.load`` -- which rebuilds via ``construct_gridded_tnp(**config)``
+        # with no TaskLoader -- reproduces the same ``y_grid_encoder`` width.
+        "num_gridded_contexts": num_gridded_contexts,
         "d_model": d_model,
         "num_heads": num_heads,
         "num_layers": num_layers,
@@ -1288,6 +1354,29 @@ def _to_torch_float(value) -> torch.Tensor:
     return torch.as_tensor(arr).float()
 
 
+def _torch_values_and_mask(value) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split a possibly-masked array into ``(values, mask)``.
+
+    ``mask`` is boolean, True where the value is observed. ``values`` is guaranteed *finite*:
+    missing entries are zero-filled. That matters because callers build density channels as
+    ``values * mask``, and ``NaN * 0`` is still NaN -- a NaN would silently poison the encoder.
+
+    Handles the three representations that reach here: a raw ``np.ma.MaskedArray`` (pre-conversion
+    tasks), an ``nps.Masked`` (post-conversion, or post-``mask_nans_nps``), and a plain array.
+    """
+    if isinstance(value, np.ma.MaskedArray):
+        mask = torch.as_tensor(~np.ma.getmaskarray(value)).bool()
+        values = torch.as_tensor(value.filled(0.0)).float()
+    elif hasattr(value, "y") and hasattr(value, "mask"):
+        values = _to_torch_float(value.y)
+        mask = torch.as_tensor(value.mask).bool()
+    else:
+        values = _to_torch_float(value)
+        mask = torch.isfinite(values)
+
+    return torch.nan_to_num(values, nan=0.0), mask
+
+
 def _align_target_tensor_to_gridded_tnp(y: torch.Tensor, n_points: int, *, name: str) -> torch.Tensor:
     if y.ndim == 2:
         y = y[None, ...]
@@ -1310,16 +1399,7 @@ def target_y_and_mask_to_gridded_tnp(y, n_points: int) -> Tuple[torch.Tensor, to
         tuple: ``(y, observed)`` tensors with shape ``[batch, n_points, dim_y]``.
         ``observed`` is True where the target should contribute to logpdf.
     """
-    if isinstance(y, np.ma.MaskedArray):
-        observed = torch.as_tensor(~np.ma.getmaskarray(y)).bool()
-        values = torch.as_tensor(y.filled(0.0)).float()
-    elif hasattr(y, "y") and hasattr(y, "mask"):
-        values = _to_torch_float(y.y)
-        observed = torch.as_tensor(y.mask).bool()
-    else:
-        values = _to_torch_float(y)
-        observed = torch.isfinite(values)
-        values = torch.nan_to_num(values, nan=0.0)
+    values, observed = _torch_values_and_mask(y)
 
     values = _align_target_tensor_to_gridded_tnp(values, n_points, name="target Y")
     observed = _align_target_tensor_to_gridded_tnp(observed, n_points, name="target mask").bool()
@@ -1398,6 +1478,38 @@ def convert_task_to_gridded_tnp_args(
                 f"Expected gridded Y with ndim 3 or 4, got shape {tuple(y_grid.shape)}"
             )
         return y_grid.permute(0, 2, 3, 1)
+
+    def grid_y_and_mask_to_tnp(y_grid) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gridded context set as ``(values, mask)`` in ``[batch, H, W, C]`` / ``[batch, H, W, 1]``.
+
+        The mask is a single channel for the whole set -- one flag per point -- which is what
+        ``mask_nans_nps`` already produces, since ``Task.op`` applies it once per context set and
+        it collapses that set's channel axis. A per-channel mask is reduced with ``any`` here too,
+        so a set is "missing at this cell" iff any of its channels is missing there.
+        """
+        values, mask = _torch_values_and_mask(y_grid)
+
+        if values.ndim == 3:
+            values = values[None, ...]
+        if mask.ndim == 3:
+            mask = mask[None, ...]
+        if values.ndim != 4:
+            raise ValueError(
+                f"Expected gridded Y with ndim 3 or 4, got shape {tuple(values.shape)}"
+            )
+        if mask.ndim != 4:
+            raise ValueError(
+                f"Expected gridded Y mask with ndim 3 or 4, got shape {tuple(mask.shape)}"
+            )
+        if mask.shape[1] != 1:
+            mask = mask.any(dim=1, keepdim=True)
+        if mask.shape[0] != values.shape[0] or tuple(mask.shape[2:]) != tuple(values.shape[2:]):
+            raise ValueError(
+                "Gridded Y and its mask disagree on batch/spatial dims: "
+                f"Y {tuple(values.shape)}, mask {tuple(mask.shape)}"
+            )
+        mask = mask.to(values.dtype)
+        return values.permute(0, 2, 3, 1), mask.permute(0, 2, 3, 1)
 
     def grid_x_tuple_to_tnp(
         x_grid_tuple: Tuple[torch.Tensor, torch.Tensor],
@@ -1478,7 +1590,7 @@ def convert_task_to_gridded_tnp_args(
 
     for x_ci, y_ci in zip(X_c, Y_c):
         if isinstance(x_ci, tuple):
-            yc_grid = grid_y_to_tnp(y_ci)
+            yc_grid, yc_grid_mask = grid_y_and_mask_to_tnp(y_ci)
             batch_size = yc_grid.shape[0]
             xc_grid = grid_x_tuple_to_tnp(x_ci, batch_size=batch_size)
             if model_variant == "gridded":
@@ -1486,7 +1598,7 @@ def convert_task_to_gridded_tnp_args(
                 point_xc.append(xc_point)
                 point_yc.append(yc_point)
             else:
-                gridded_contexts.append((xc_grid, yc_grid))
+                gridded_contexts.append((xc_grid, yc_grid, yc_grid_mask))
         else:
             xc_point = point_x_to_tnp(x_ci)
             point_xc.append(xc_point)
@@ -1535,10 +1647,32 @@ def convert_task_to_gridded_tnp_args(
         raise ValueError(
             "model_variant='ootg' requires at least one gridded context set (tuple-valued X_c)."
         )
-    if len(gridded_contexts) > 1:
-        raise NotImplementedError(
-            "Multiple gridded context sets are not yet supported for model_variant='ootg'."
-        )
 
-    xc_grid, yc_grid = gridded_contexts[0]
+    # Every gridded set is sampled on the same lat/lon grid, so they share one set of
+    # coordinates and differ only in values. Refuse to guess if that ever stops holding.
+    xc_grid = gridded_contexts[0][0]
+    for other_xc_grid, _, _ in gridded_contexts[1:]:
+        same_shape = tuple(other_xc_grid.shape) == tuple(xc_grid.shape)
+        if not same_shape or not torch.allclose(
+            other_xc_grid.to(dtype=xc_grid.dtype, device=xc_grid.device), xc_grid
+        ):
+            raise ValueError(
+                "All gridded context sets must share the same grid coordinates for "
+                "model_variant='ootg', got shapes "
+                f"{tuple(xc_grid.shape)} and {tuple(other_xc_grid.shape)}."
+            )
+
+    # One density channel per set, mask first: ``[mask_1, y_1, mask_2, y_2, ...]``. This is the
+    # layout neuralprocesses builds in ``PrependDensityChannel`` as ``concat(z.mask, z.y *
+    # z.mask)``, and its width is ``sum(dim_yc_values[:num_gridded_contexts]) +
+    # num_gridded_contexts`` -- exactly the ``y_grid_encoder`` input width built in
+    # ``construct_gridded_tnp``. Because each mask is per-set, a NaN in one set only hides that
+    # set at that cell; the others keep their real values.
+    yc_grid = torch.cat(
+        [
+            torch.cat((mask, values * mask), dim=-1)
+            for _, values, mask in gridded_contexts
+        ],
+        dim=-1,
+    )
     return xc, yc, xc_grid, yc_grid, xt
